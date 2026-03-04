@@ -9,7 +9,7 @@
 ║                                                                      ║
 ║   Transfer Any Texture. Any Shader. Any Target.                      ║
 ║   Author  : Youssef El Qadi                                          ║
-║   Version : 4.1.0 — Fixed Node Chain Rewiring                       ║
+║   Version : 4.2.0 — Destination-driven convert_and_wire            ║
 ║   Support : Maya 2020+                                               ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
@@ -54,56 +54,87 @@ AUTO_SUGGEST = {
 
 NODE_CONVERSION_TABLE = {
     # ── bump2d (height map) ───────────────────────────────────────────
+    # canonical_output: plug on the *new* node that must connect to shader bump slot
     "bump2d": {
         "Redshift": {
-            "type":     "RedshiftBumpMap",
-            "inputs":   {"bumpValue": "input"},   # file.outAlpha → bump.input
-            "outputs":  {"outNormal": "out"},     # bump.out → shader.bump_input
-            "post_set": {"inputType": 0},
+            "type":             "RedshiftBumpMap",
+            "inputs":           {"bumpValue": "input"},   # file.outAlpha → bump.input
+            "outputs":          {"outNormal": "out"},     # bump.out → shader.bump_input
+            "canonical_output": "out",                    # RedshiftBumpMap always uses "out"
+            "post_set":         {"inputType": 0},
         },
         "Arnold": {
-            "type":    "bump2d",
-            "inputs":  {"bumpValue": "bumpValue"},
-            "outputs": {"outNormal": "outNormal"},
+            "type":             "bump2d",
+            "inputs":           {"bumpValue": "bumpValue"},
+            "outputs":          {"outNormal": "outNormal"},
+            "canonical_output": "outNormal",
         },
         "Maya": {
-            "type":    "bump2d",
-            "inputs":  {"bumpValue": "bumpValue"},
-            "outputs": {"outNormal": "outNormal"},
+            "type":             "bump2d",
+            "inputs":           {"bumpValue": "bumpValue"},
+            "outputs":          {"outNormal": "outNormal"},
+            "canonical_output": "outNormal",
         },
     },
     # ── aiNormalMap (tangent normal) ──────────────────────────────────
     "aiNormalMap": {
         "Redshift": {
-            "type":     "RedshiftBumpMap",
-            "inputs":   {"input": "input"},       # file.outColor → bump.input
-            "outputs":  {"outValue": "out"},      # bump.out → shader.bump_input
-            "post_set": {"inputType": 1},
+            "type":             "RedshiftBumpMap",
+            "inputs":           {"input": "input"},       # file.outColor → bump.input
+            "outputs":          {"outValue": "out"},      # bump.out → shader.bump_input
+            "canonical_output": "out",
+            "post_set":         {"inputType": 1},
         },
         "Arnold": {
-            "type":    "aiNormalMap",
-            "inputs":  {"input": "input"},
-            "outputs": {"outValue": "outValue"},
+            "type":             "aiNormalMap",
+            "inputs":           {"input": "input"},
+            "outputs":          {"outValue": "outValue"},
+            "canonical_output": "outValue",
         },
         "Maya": {
-            "type":     "bump2d",
-            "inputs":   {"input": "bumpValue"},
-            "outputs":  {"outValue": "outNormal"},
-            "post_set": {"bumpInterp": 1},
+            "type":             "bump2d",
+            "inputs":           {"input": "bumpValue"},
+            "outputs":          {"outValue": "outNormal"},
+            "canonical_output": "outNormal",
+            "post_set":         {"bumpInterp": 1},
         },
     },
-    # ── RedshiftBumpMap → Arnold ──────────────────────────────────────
+    # ── RedshiftBumpMap → Arnold / Maya ───────────────────────────────
     "RedshiftBumpMap": {
         "Arnold": {
-            "type":    "aiNormalMap",
-            "inputs":  {"input": "input"},
-            "outputs": {"out": "outValue"},
+            "type":             "aiNormalMap",
+            "inputs":           {"input": "input"},
+            "outputs":          {"out": "outValue"},
+            "canonical_output": "outValue",
         },
         "Maya": {
-            "type":     "bump2d",
-            "inputs":   {"input": "bumpValue"},
-            "outputs":  {"out": "outNormal"},
-            "post_set": {"bumpInterp": 1},
+            "type":             "bump2d",
+            "inputs":           {"input": "bumpValue"},
+            "outputs":          {"out": "outNormal"},
+            "canonical_output": "outNormal",
+            "post_set":         {"bumpInterp": 1},
+        },
+    },
+    # ── aiBump2d (Arnold height bump) ──────────────────────────────────
+    "aiBump2d": {
+        "Redshift": {
+            "type":             "RedshiftBumpMap",
+            "inputs":           {"bumpValue": "input"},
+            "outputs":          {"outNormal": "out"},
+            "canonical_output": "out",
+            "post_set":         {"inputType": 0},
+        },
+        "Arnold": {
+            "type":             "aiBump2d",
+            "inputs":           {"bumpValue": "bumpValue"},
+            "outputs":          {"outNormal": "outNormal"},
+            "canonical_output": "outNormal",
+        },
+        "Maya": {
+            "type":             "bump2d",
+            "inputs":           {"bumpValue": "bumpValue"},
+            "outputs":          {"outNormal": "outNormal"},
+            "canonical_output": "outNormal",
         },
     },
     # ── Color Correct ─────────────────────────────────────────────────
@@ -178,6 +209,83 @@ NODE_CONVERSION_TABLE = {
         },
     },
 }
+
+# Bump/normal chain: node types that output to shader normal/bump slots.
+# Used to ensure converted bump node output is always wired to shader.
+BUMP_NODE_TYPES = frozenset(["bump2d", "aiNormalMap", "RedshiftBumpMap", "aiBump2d"])
+# Shader attributes that expect a bump/normal node output (not a raw file).
+BUMP_SLOT_ATTRS = frozenset(["normalCamera", "bump_input"])
+# When source is a file directly on a bump slot, create this bump node for target renderer.
+# (node_type, canonical_output_attr, input_attr_for_texture)
+DEFAULT_BUMP_NODE_FOR_RENDERER = {
+    "Redshift": ("RedshiftBumpMap", "out", "input"),   # inputType set after connect
+    "Arnold":   ("aiNormalMap", "outValue", "input"),
+    "Maya":     ("bump2d", "outNormal", "bumpValue"),
+}
+# Canonical output plug name per bump node type (for wiring to shader bump slot).
+CANONICAL_OUTPUT_BY_BUMP_TYPE = {
+    "RedshiftBumpMap": "out",
+    "bump2d":          "outNormal",
+    "aiNormalMap":     "outValue",
+    "aiBump2d":        "outNormal",
+}
+# Filename substrings (case-insensitive) that indicate a normal map texture.
+NORMAL_MAP_FILENAME_SUBSTRINGS = (
+    "normal", "nrm", "nor", "normalgl", "normgl", "normaldx", "normdx",
+)
+
+
+def file_texture_name_is_normal(file_node):
+    """Return True if the file node's texture path suggests a normal map."""
+    if not file_node or cmds.nodeType(file_node) != "file":
+        return False
+    try:
+        path = cmds.getAttr("%s.fileTextureName" % file_node) or ""
+    except Exception:
+        return False
+    base = path.split("/")[-1].split("\\")[-1].lower()
+    return any(s in base for s in NORMAL_MAP_FILENAME_SUBSTRINGS)
+
+
+def get_file_plug_for_bump_mode(file_node, is_normal):
+    """Return the file plug to use for bump: outColor for normal, outAlpha for height."""
+    attr = "outColor" if is_normal else "outAlpha"
+    return "%s.%s" % (file_node, attr)
+
+
+def find_upstream_bump_plug(shader_node, shader_bump_attr):
+    """Returns the plug that drives the shader bump slot, or None."""
+    plugs = cmds.listConnections(
+        "%s.%s" % (shader_node, shader_bump_attr),
+        source=True, destination=False, plugs=True
+    ) or []
+    return plugs[0] if plugs else None
+
+
+def find_first_bump_node_upstream(start_plug, max_depth=50):
+    """
+    Walk upstream from the node of start_plug; return the first bump node found.
+    Handles: file -> colorCorrect -> bump2d -> shader and file -> colorCorrect -> shader (no bump).
+    """
+    if not start_plug:
+        return None
+    visited = set()
+    start_node = start_plug.split(".")[0]
+    queue = [start_node]
+    depth = 0
+    while queue and depth < max_depth:
+        node = queue.pop(0)
+        if node in visited:
+            continue
+        visited.add(node)
+        ntype = cmds.nodeType(node)
+        if ntype in BUMP_NODE_TYPES:
+            return node
+        ups = cmds.listConnections(node, source=True, destination=False) or []
+        queue.extend(ups)
+        depth += 1
+    return None
+
 
 PASSTHROUGH_NODES = {
     "file", "place2dTexture", "colorCorrect",
@@ -473,7 +581,11 @@ def auto_suggest_target(shaders):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  SMART NODE CHAIN CONVERTER  ← THE FIXED CORE
+#  DESTINATION-DRIVEN NODE CHAIN CONVERTER
+#  convert_and_wire(source_plug, target_plug, ...) converts the graph
+#  feeding source_plug and ALWAYS connects the resulting output to target_plug
+#  (step 5 guarantee). Used for all texture transfers so no auto-created node
+#  is left dangling. Bump slots get canonical output and file->bump insertion.
 # ══════════════════════════════════════════════════════════════════════
 
 def _safe_connect(src, dst, log=None):
@@ -481,22 +593,223 @@ def _safe_connect(src, dst, log=None):
     try:
         if not cmds.objExists(src.split(".")[0]):
             if log is not None:
-                log.append(f"  [SKIP] Source gone: {src}")
+                log.append("  [SKIP] Source gone: %s" % src)
             return False
         if not cmds.objExists(dst.split(".")[0]):
             if log is not None:
-                log.append(f"  [SKIP] Dest gone: {dst}")
+                log.append("  [SKIP] Dest gone: %s" % dst)
             return False
         if cmds.isConnected(src, dst):
             return True
         cmds.connectAttr(src, dst, force=True)
         if log is not None:
-            log.append(f"  [WIRE] {src}  →  {dst}")
+            log.append("  [WIRE] %s  →  %s" % (src, dst))
         return True
     except Exception as e:
         if log is not None:
-            log.append(f"  [WIRE-FAIL] {src} → {dst}: {e}")
+            log.append("  [WIRE-FAIL] %s → %s: %s" % (src, dst, e))
         return False
+
+
+def convert_and_wire(source_plug, target_plug, target_renderer, cache, log,
+                     target_is_bump_slot=False):
+    """
+    Destination-driven conversion: convert the graph feeding source_plug so that
+    the equivalent output drives target_plug. Recursively converts upstream
+    nodes and ALWAYS connects the final output to target_plug (step 5 guarantee).
+    When wiring into a bump node's .input from a file, coerces to outColor (normal)
+    or outAlpha (height) to avoid datatype mismatch on RedshiftBumpMap.
+    """
+    if not source_plug or not target_plug:
+        return False
+    src_node = source_plug.split(".")[0]
+    src_attr = source_plug.split(".", 1)[1] if "." in source_plug else source_plug
+    if not cmds.objExists(src_node):
+        log.append("  [SKIP] Source node gone: %s" % src_node)
+        return False
+    dst_node = target_plug.split(".")[0]
+    dst_attr = target_plug.split(".", 1)[1] if "." in target_plug else target_plug
+    if not cmds.objExists(dst_node):
+        log.append("  [SKIP] Target node gone: %s" % target_plug)
+        return False
+
+    node_type = cmds.nodeType(src_node)
+
+    # Coerce file plug when destination is a bump node's .input (e.g. RedshiftBumpMap)
+    # Normal => file.outColor, height => file.outAlpha to avoid datatype mismatch.
+    if (node_type == "file" and dst_attr == "input" and
+            cmds.nodeType(dst_node) in BUMP_NODE_TYPES):
+        is_normal = False
+        if cmds.nodeType(dst_node) == "RedshiftBumpMap":
+            try:
+                if cmds.getAttr("%s.inputType" % dst_node) == 1:
+                    is_normal = True
+            except Exception:
+                pass
+        if not is_normal:
+            is_normal = file_texture_name_is_normal(src_node)
+        source_plug = get_file_plug_for_bump_mode(src_node, is_normal)
+        src_attr = source_plug.split(".", 1)[1]
+        if is_normal and cmds.nodeType(dst_node) == "RedshiftBumpMap":
+            try:
+                cmds.setAttr("%s.inputType" % dst_node, 1)
+            except Exception:
+                pass
+    conversion = NODE_CONVERSION_TABLE.get(node_type, {}).get(target_renderer)
+    is_passthrough = node_type in PASSTHROUGH_NODES
+    same_type = conversion and conversion.get("type") == node_type
+
+    # ── Already converted: use cached node, compute output plug, connect ──
+    if src_node in cache:
+        new_node = cache[src_node]
+        out_attr = src_attr
+        if conversion and new_node != src_node:
+            out_map = conversion.get("outputs", {})
+            out_attr = out_map.get(src_attr, src_attr)
+            if target_is_bump_slot and cmds.nodeType(new_node) in BUMP_NODE_TYPES:
+                out_attr = CANONICAL_OUTPUT_BY_BUMP_TYPE.get(
+                    cmds.nodeType(new_node), out_attr
+                )
+        elif target_is_bump_slot and node_type in BUMP_NODE_TYPES and new_node == src_node:
+            out_attr = CANONICAL_OUTPUT_BY_BUMP_TYPE.get(node_type, src_attr)
+        out_plug = "%s.%s" % (new_node, out_attr)
+        ok = _safe_connect(out_plug, target_plug, log)
+        if ok and not cmds.isConnected(out_plug, target_plug):
+            log.append("  [ERROR] Not connected after wire: %s -> %s" % (out_plug, target_plug))
+        return ok
+
+    # ── Passthrough (file, ramp, etc.): keep node, connect output to target ──
+    # (Bump-slot handling is done in do_transfer via ensure_bump_chain / find_first_bump_node_upstream)
+    if is_passthrough:
+        cache[src_node] = src_node
+        ok = _safe_connect(source_plug, target_plug, log)
+        if ok and not cmds.isConnected(source_plug, target_plug):
+            log.append("  [ERROR] Not connected: %s -> %s" % (source_plug, target_plug))
+        return ok
+
+    # ── No conversion rule: keep node, connect ──
+    if not conversion:
+        cache[src_node] = src_node
+        ok = _safe_connect(source_plug, target_plug, log)
+        if ok and not cmds.isConnected(source_plug, target_plug):
+            log.append("  [ERROR] Not connected: %s -> %s" % (source_plug, target_plug))
+        return ok
+
+    new_type = conversion["type"]
+    # Same type: no new node, just connect (use canonical out for bump slot)
+    if new_type == node_type:
+        cache[src_node] = src_node
+        out_attr = src_attr
+        if target_is_bump_slot and node_type in BUMP_NODE_TYPES:
+            out_attr = CANONICAL_OUTPUT_BY_BUMP_TYPE.get(node_type, src_attr)
+        else:
+            out_map = conversion.get("outputs", {})
+            out_attr = out_map.get(src_attr, src_attr)
+        out_plug = "%s.%s" % (src_node, out_attr)
+        ok = _safe_connect(out_plug, target_plug, log)
+        if ok and not cmds.isConnected(out_plug, target_plug):
+            log.append("  [ERROR] Not connected: %s -> %s" % (out_plug, target_plug))
+        return ok
+
+    if new_type not in (cmds.allNodeTypes() or []):
+        log.append("  [WARN] Node type '%s' not in Maya — keeping '%s'" % (new_type, node_type))
+        cache[src_node] = src_node
+        ok = _safe_connect(source_plug, target_plug, log)
+        return ok
+
+    # ── Create new node ──
+    new_node = cmds.shadingNode(new_type, asUtility=True,
+                                name=src_node + "_conv")
+    log.append("  [CREATE] %s -> %s  (%s -> %s)" % (node_type, new_type, src_node, new_node))
+    cache[src_node] = new_node
+
+    for attr, val in conversion.get("post_set", {}).items():
+        try:
+            cmds.setAttr("%s.%s" % (new_node, attr), val)
+            log.append("  [SET]    %s.%s = %s" % (new_node, attr, val))
+        except Exception as e:
+            log.append("  [WARN]   setAttr %s.%s: %s" % (new_node, attr, e))
+
+    # Recreate incoming connections: recurse for each input
+    input_map = conversion.get("inputs", {})
+    for old_in_attr, new_in_attr in input_map.items():
+        if not cmds.attributeQuery(old_in_attr, node=src_node, exists=True):
+            continue
+        upstream_plugs = cmds.listConnections(
+            "%s.%s" % (src_node, old_in_attr), **_lc_kwargs()) or []
+        for up_plug in upstream_plugs:
+            convert_and_wire(up_plug, "%s.%s" % (new_node, new_in_attr),
+                            target_renderer, cache, log)
+
+    # Output plug: use outputs map, or canonical for bump slot
+    out_map = conversion.get("outputs", {})
+    out_attr = out_map.get(src_attr, src_attr)
+    if target_is_bump_slot and new_type in BUMP_NODE_TYPES:
+        out_attr = conversion.get("canonical_output") or CANONICAL_OUTPUT_BY_BUMP_TYPE.get(
+            new_type, out_attr
+        )
+    out_plug = "%s.%s" % (new_node, out_attr)
+
+    # Step 5: ALWAYS connect the converted node output to target_plug
+    ok = _safe_connect(out_plug, target_plug, log)
+    if not cmds.isConnected(out_plug, target_plug):
+        log.append("  [ERROR] Not connected: %s -> %s" % (out_plug, target_plug))
+    return ok
+
+
+def ensure_bump_chain(source_plug, dst_shader, dst_bump_attr, target_renderer, cache, log,
+                      force_mode=None):
+    """
+    Always build the bump node first, then explicitly wire the upstream network
+    into the bump node input. Coerces file plugs to outColor (normal) or outAlpha
+    (height) so RedshiftBumpMap.input gets the correct datatype. Sets inputType
+    before wiring. force_mode: "height" or "normal" or None (auto from filename).
+    """
+    default_bump = DEFAULT_BUMP_NODE_FOR_RENDERER.get(target_renderer)
+    if not default_bump:
+        return False
+    bump_type, canonical_out, bump_input_attr = default_bump
+    if bump_type not in (cmds.allNodeTypes() or []):
+        log.append("  [BUMP-WARN] '%s' not available." % bump_type)
+        return False
+    bump_node = cmds.shadingNode(bump_type, asUtility=True,
+                                 name="%s_NF_bump" % dst_shader)
+    log.append("  [BUMP] Created %s: %s" % (bump_type, bump_node))
+
+    # Coerce source plug when it comes from a file: normal => outColor, height => outAlpha
+    wire_plug = source_plug
+    src_node = source_plug.split(".")[0] if source_plug else ""
+    if src_node and cmds.objExists(src_node) and cmds.nodeType(src_node) == "file":
+        is_normal = False
+        if force_mode == "normal":
+            is_normal = True
+        elif force_mode == "height":
+            is_normal = False
+        else:
+            is_normal = file_texture_name_is_normal(src_node)
+        wire_plug = get_file_plug_for_bump_mode(src_node, is_normal)
+        # Set Redshift inputType BEFORE wiring so convert_and_wire sees it for recursion
+        if target_renderer == "Redshift" and bump_type == "RedshiftBumpMap":
+            try:
+                cmds.setAttr(bump_node + ".inputType", 1 if is_normal else 0)
+            except Exception:
+                pass
+
+    bump_input_plug = "%s.%s" % (bump_node, bump_input_attr)
+    ok_in = convert_and_wire(
+        wire_plug, bump_input_plug,
+        target_renderer, cache, log,
+        target_is_bump_slot=False
+    )
+
+    conns = cmds.listConnections(bump_input_plug, source=True, destination=False) or []
+    if not conns:
+        log.append("  [ERROR] Bump input not connected: %s" % bump_input_plug)
+        ok_in = False
+
+    dst_plug = "%s.%s" % (dst_shader, dst_bump_attr)
+    ok_out = _safe_connect("%s.%s" % (bump_node, canonical_out), dst_plug, log)
+    return ok_in and ok_out
 
 
 def build_converted_node(src_node, target_renderer, converted_cache, log):
@@ -504,6 +817,9 @@ def build_converted_node(src_node, target_renderer, converted_cache, log):
     Create the equivalent node for target_renderer if needed.
     Recursively rebuild the FULL upstream chain.
     Returns the NEW node name (or the original if no conversion needed).
+    Bump-chain fix: NODE_CONVERSION_TABLE now includes canonical_output for bump
+    nodes; do_transfer/resolve_output_plug use it so the shader always gets
+    the bump node's correct output plug (e.g. RedshiftBumpMap.out).
     """
     if src_node in converted_cache:
         return converted_cache[src_node]
@@ -591,12 +907,14 @@ def build_converted_node(src_node, target_renderer, converted_cache, log):
     return new_node
 
 
-def resolve_output_plug(source_plug, target_renderer, converted_cache, log):
+def resolve_output_plug(source_plug, target_renderer, converted_cache, log,
+                        target_is_bump_slot=False):
     """
     Given the original source plug (e.g. bump2d1.outNormal),
     return the correct output plug after node conversion.
-
-    This is what actually gets connected to the shader attribute.
+    When target_is_bump_slot is True, returns the canonical bump output plug
+    so the shader's bump/normal input is always driven by the bump node's
+    proper output (e.g. RedshiftBumpMap.out, bump2d.outNormal).
     """
     src_node = source_plug.split(".")[0]
     src_attr = source_plug.split(".", 1)[1]
@@ -606,14 +924,71 @@ def resolve_output_plug(source_plug, target_renderer, converted_cache, log):
     converted = build_converted_node(src_node, target_renderer, converted_cache, log)
 
     if converted == src_node:
-        # No conversion happened — use original plug as-is
+        # No conversion happened — use original plug as-is unless we need canonical bump out
+        if target_is_bump_slot and node_type in BUMP_NODE_TYPES:
+            canonical = CANONICAL_OUTPUT_BY_BUMP_TYPE.get(node_type, src_attr)
+            return f"{converted}.{canonical}"
         return source_plug
 
     # Remap the output attribute
     conversion = NODE_CONVERSION_TABLE.get(node_type, {}).get(target_renderer, {})
     out_map = conversion.get("outputs", {})
     new_attr = out_map.get(src_attr, src_attr)
+    # For bump slots, always use the canonical output of the converted node
+    # so the shader is driven by the bump node's correct plug.
+    converted_type = cmds.nodeType(converted)
+    if target_is_bump_slot and converted_type in BUMP_NODE_TYPES:
+        new_attr = CANONICAL_OUTPUT_BY_BUMP_TYPE.get(converted_type, new_attr)
     return f"{converted}.{new_attr}"
+
+
+def create_bump_node_for_file(entry, target_renderer, converted_cache, log):
+    """
+    When the source is a file (or other non-bump) connected directly to a
+    bump/normal slot, create the appropriate bump node for target renderer,
+    wire the file chain into it, and return the plug to connect to the shader.
+    Ensures: <convertedBumpNode>.<canonicalOutput> → shader.bump_input/normalCamera.
+    """
+    default_bump = DEFAULT_BUMP_NODE_FOR_RENDERER.get(target_renderer)
+    if not default_bump:
+        return None
+    bump_type, canonical_out, input_attr = default_bump
+    if bump_type not in (cmds.allNodeTypes() or []):
+        log.append("  [BUMP] [WARN] Bump type '%s' not available in Maya." % bump_type)
+        return None
+
+    source_node = entry["source_node"]
+    source_plug = entry["source_plug"]
+    src_attr = source_plug.split(".", 1)[1] if source_plug else "outColor"
+
+    # Convert upstream (file stays as file; any color correctors etc. get converted)
+    converted_src = build_converted_node(source_node, target_renderer, converted_cache, log)
+    # Use same attribute on converted source (e.g. outColor or outAlpha)
+    if converted_src != source_node:
+        node_type = cmds.nodeType(source_node)
+        conv = NODE_CONVERSION_TABLE.get(node_type, {}).get(target_renderer, {})
+        out_map = conv.get("outputs", {})
+        src_attr = out_map.get(src_attr, src_attr)
+    src_plug = "%s.%s" % (converted_src, src_attr)
+
+    # Create bump node
+    new_bump = cmds.shadingNode(bump_type, asUtility=True,
+                                name=source_node + "_bump_%s" % target_renderer[:2])
+    log.append("  [BUMP] Created %s %s for shader (file → bump chain)" % (bump_type, new_bump))
+
+    # Redshift: set inputType 0=height (outAlpha), 1=tangent normal (outColor)
+    if target_renderer == "Redshift" and bump_type == "RedshiftBumpMap":
+        try:
+            cmds.setAttr(new_bump + ".inputType", 1 if src_attr == "outColor" else 0)
+        except Exception:
+            pass
+
+    dst_plug = "%s.%s" % (new_bump, input_attr)
+    _safe_connect(src_plug, dst_plug, log)
+
+    out_plug = "%s.%s" % (new_bump, canonical_out)
+    log.append("  [BUMP] %s.%s → shader bump slot" % (new_bump, canonical_out))
+    return out_plug
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -725,10 +1100,16 @@ def validate_transfer(data, target_node, target_mat_type):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  DO TRANSFER  ← FIXED: uses resolve_output_plug for full chain
+#  DO TRANSFER  ← FIXED: bump slot always wired from bump node canonical output
 # ══════════════════════════════════════════════════════════════════════
 
 def do_transfer(data, target_node, target_mat_type, mash_waiter=None):
+    """
+    Bump-chain fix: For normalCamera / bump_input slots we always connect the
+    canonical output of a bump node to the shader. If source is a file we
+    create a bump node and wire file→bump→shader; otherwise we convert the
+    existing bump node and wire its canonical output (e.g. .out, .outNormal).
+    """
     log = []
     color_node = None
     converted_cache = {}   # shared per-shader transfer
@@ -779,33 +1160,46 @@ def do_transfer(data, target_node, target_mat_type, mash_waiter=None):
         # ── Transfer texture ───────────────────────────────────────────
         if mode == "texture":
             source_plug = entry["source_plug"]
-            source_node = entry["source_node"]
-            node_type   = cmds.nodeType(source_node)
-
-            # Case A: source IS a file node — use preferred output directly
-            if node_type == "file":
-                final_plug = f"{source_node}.{entry['preferred_plug']}"
-
-            # Case B: source is an intermediate node (bump2d, aiNormalMap, etc.)
-            # → convert the full chain and get the correct output plug
-            else:
-                final_plug = resolve_output_plug(
-                    source_plug, target_renderer, converted_cache, log
-                )
-
-            fp_node = final_plug.split(".")[0]
-            if not cmds.objExists(fp_node):
-                log.append(f"[SKIP] Source node '{fp_node}' gone.")
+            if not source_plug:
+                log.append("[SKIP] No source plug for texture entry.")
                 continue
-
-            try:
-                if cmds.isConnected(final_plug, dst_plug):
-                    log.append(f"[SKIP] Already connected: {final_plug} → {dst_plug}")
+            is_bump = (
+                entry["shader_attr"] in BUMP_SLOT_ATTRS or
+                tgt_attr in BUMP_SLOT_ATTRS
+            )
+            if is_bump:
+                dst_shader = target_node
+                dst_attr = tgt_attr  # bump_input for RS, normalCamera for Arnold/Maya
+                bump_root = find_first_bump_node_upstream(source_plug)
+                if bump_root:
+                    bump_out_attr = CANONICAL_OUTPUT_BY_BUMP_TYPE.get(
+                        cmds.nodeType(bump_root), "outNormal"
+                    )
+                    bump_out_plug = "%s.%s" % (bump_root, bump_out_attr)
+                    ok = convert_and_wire(
+                        bump_out_plug, "%s.%s" % (dst_shader, dst_attr),
+                        target_renderer, converted_cache, log,
+                        target_is_bump_slot=True
+                    )
                 else:
-                    cmds.connectAttr(final_plug, dst_plug, force=True)
-                    log.append(f"[OK-T] {final_plug:<52}  →  {dst_plug}")
-            except Exception as e:
-                log.append(f"[FAIL] {final_plug}  →  {dst_plug}\n       {e}")
+                    ok = ensure_bump_chain(
+                        source_plug, dst_shader, dst_attr, target_renderer,
+                        converted_cache, log, force_mode=None
+                    )
+                log.append(
+                    "[OK-T] bump %s -> %s.%s" % (source_plug, dst_shader, dst_attr)
+                    if ok else "[FAIL] bump %s -> %s.%s" % (source_plug, dst_shader, dst_attr)
+                )
+                continue
+            # Non-bump path
+            ok = convert_and_wire(
+                source_plug, dst_plug, target_renderer, converted_cache, log,
+                target_is_bump_slot=False
+            )
+            if ok:
+                log.append("[OK-T] %s  ->  %s" % (source_plug, dst_plug))
+            else:
+                log.append("[FAIL] texture %s -> %s" % (source_plug, dst_plug))
 
         # ── Transfer raw value ─────────────────────────────────────────
         elif mode == "value":
@@ -1076,7 +1470,7 @@ class NodeFlowTool(QtWidgets.QDialog):
         lc  = QtWidgets.QVBoxLayout()
         t   = QtWidgets.QLabel("⚡  NodeFlow")
         s   = QtWidgets.QLabel(
-            "Transfer Any Texture · Any Shader · Any Target  |  v4.1.0"
+            "Transfer Any Texture · Any Shader · Any Target  |  v4.2.0"
         )
         t.setObjectName("titleLabel")
         s.setObjectName("subtitleLabel")
