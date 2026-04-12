@@ -9,7 +9,7 @@
 ║                                                                      ║
 ║   Transfer Any Texture. Any Shader. Any Target.                      ║
 ║   Author  : Youssef El Qadi                                          ║
-║   Version : 4.2.0 — Destination-driven convert_and_wire            ║
+║   Version : 4.3.0 — Full bi-directional PBR mapping               ║
 ║   Support : Maya 2020+                                               ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
@@ -54,13 +54,12 @@ AUTO_SUGGEST = {
 
 NODE_CONVERSION_TABLE = {
     # ── bump2d (height map) ───────────────────────────────────────────
-    # canonical_output: plug on the *new* node that must connect to shader bump slot
     "bump2d": {
         "Redshift": {
             "type":             "RedshiftBumpMap",
-            "inputs":           {"bumpValue": "input"},   # file.outAlpha → bump.input
-            "outputs":          {"outNormal": "out"},     # bump.out → shader.bump_input
-            "canonical_output": "out",                    # RedshiftBumpMap always uses "out"
+            "inputs":           {"bumpValue": "input"},
+            "outputs":          {"outNormal": "out"},
+            "canonical_output": "out",
             "post_set":         {"inputType": 0},
         },
         "Arnold": {
@@ -80,8 +79,8 @@ NODE_CONVERSION_TABLE = {
     "aiNormalMap": {
         "Redshift": {
             "type":             "RedshiftBumpMap",
-            "inputs":           {"input": "input"},       # file.outColor → bump.input
-            "outputs":          {"outValue": "out"},      # bump.out → shader.bump_input
+            "inputs":           {"input": "input"},
+            "outputs":          {"outValue": "out"},
             "canonical_output": "out",
             "post_set":         {"inputType": 1},
         },
@@ -115,7 +114,23 @@ NODE_CONVERSION_TABLE = {
             "post_set":         {"bumpInterp": 1},
         },
     },
-    # ── aiBump2d (Arnold height bump) ──────────────────────────────────
+    # ── RedshiftNormalMap → Arnold / Maya ─────────────────────────────
+    "RedshiftNormalMap": {
+        "Arnold": {
+            "type":             "aiNormalMap",
+            "inputs":           {"tex0": "input"},
+            "outputs":          {"out": "outValue"},
+            "canonical_output": "outValue",
+        },
+        "Maya": {
+            "type":             "bump2d",
+            "inputs":           {"tex0": "bumpValue"},
+            "outputs":          {"out": "outNormal"},
+            "canonical_output": "outNormal",
+            "post_set":         {"bumpInterp": 1},
+        },
+    },
+    # ── aiBump2d (Arnold height bump) ─────────────────────────────────
     "aiBump2d": {
         "Redshift": {
             "type":             "RedshiftBumpMap",
@@ -172,6 +187,24 @@ NODE_CONVERSION_TABLE = {
             "outputs": {"outColor": "outColor"},
         },
     },
+    # Maya native colorCorrect → renderer-specific
+    "colorCorrect": {
+        "Redshift": {
+            "type":    "rsColorCorrect",
+            "inputs":  {"inColor": "input"},
+            "outputs": {"outColor": "outColor"},
+        },
+        "Arnold": {
+            "type":    "aiColorCorrect",
+            "inputs":  {"inColor": "input"},
+            "outputs": {"outColor": "outColor"},
+        },
+        "Maya": {
+            "type":    "colorCorrect",
+            "inputs":  {"inColor": "inColor"},
+            "outputs": {"outColor": "outColor"},
+        },
+    },
     # ── Range ─────────────────────────────────────────────────────────
     "aiRange": {
         "Redshift": {
@@ -186,6 +219,23 @@ NODE_CONVERSION_TABLE = {
         },
         "Arnold": {
             "type":    "aiRange",
+            "inputs":  {"input": "input"},
+            "outputs": {"outColor": "outColor"},
+        },
+    },
+    "rsRange": {
+        "Arnold": {
+            "type":    "aiRange",
+            "inputs":  {"input": "input"},
+            "outputs": {"outColor": "outColor"},
+        },
+        "Maya": {
+            "type":    "remapValue",
+            "inputs":  {"input": "inputValue"},
+            "outputs": {"outColor": "outValue"},
+        },
+        "Redshift": {
+            "type":    "rsRange",
             "inputs":  {"input": "input"},
             "outputs": {"outColor": "outColor"},
         },
@@ -208,26 +258,59 @@ NODE_CONVERSION_TABLE = {
             "outputs": {"outColor": "outColor"},
         },
     },
+    "rsColorLayer": {
+        "Arnold": {
+            "type":    "aiMultiply",
+            "inputs":  {"input1": "input1"},
+            "outputs": {"outColor": "outColor"},
+        },
+        "Maya": {
+            "type":    "multiplyDivide",
+            "inputs":  {"input1": "input1"},
+            "outputs": {"outColor": "output"},
+        },
+        "Redshift": {
+            "type":    "rsColorLayer",
+            "inputs":  {"input1": "input1"},
+            "outputs": {"outColor": "outColor"},
+        },
+    },
+    # ── rsTexture (Redshift native file) → file ──────────────────────
+    "rsTexture": {
+        "Arnold": {
+            "type":    "file",
+            "inputs":  {"tex0": "fileTextureName"},
+            "outputs": {"outColor": "outColor", "outAlpha": "outAlpha"},
+        },
+        "Maya": {
+            "type":    "file",
+            "inputs":  {"tex0": "fileTextureName"},
+            "outputs": {"outColor": "outColor", "outAlpha": "outAlpha"},
+        },
+    },
 }
 
 # Bump/normal chain: node types that output to shader normal/bump slots.
 # Used to ensure converted bump node output is always wired to shader.
-BUMP_NODE_TYPES = frozenset(["bump2d", "aiNormalMap", "RedshiftBumpMap", "aiBump2d"])
+BUMP_NODE_TYPES = frozenset([
+    "bump2d", "aiNormalMap", "RedshiftBumpMap", "RedshiftNormalMap", "aiBump2d",
+])
 # Shader attributes that expect a bump/normal node output (not a raw file).
-BUMP_SLOT_ATTRS = frozenset(["normalCamera", "bump_input"])
+BUMP_SLOT_ATTRS = frozenset(["normalCamera", "bump_input", "coat_bump_input", "coatNormal"])
 # When source is a file directly on a bump slot, create this bump node for target renderer.
 # (node_type, canonical_output_attr, input_attr_for_texture)
 DEFAULT_BUMP_NODE_FOR_RENDERER = {
-    "Redshift": ("RedshiftBumpMap", "out", "input"),   # inputType set after connect
+    "Redshift": ("RedshiftBumpMap", "out", "input"),
     "Arnold":   ("aiNormalMap", "outValue", "input"),
     "Maya":     ("bump2d", "outNormal", "bumpValue"),
 }
 # Canonical output plug name per bump node type (for wiring to shader bump slot).
 CANONICAL_OUTPUT_BY_BUMP_TYPE = {
-    "RedshiftBumpMap": "out",
-    "bump2d":          "outNormal",
-    "aiNormalMap":     "outValue",
-    "aiBump2d":        "outNormal",
+    "RedshiftBumpMap":   "out",
+    "RedshiftNormalMap": "out",
+    "bump2d":            "outNormal",
+    "aiNormalMap":       "outValue",
+    "aiBump2d":          "outNormal",
 }
 # Filename substrings (case-insensitive) that indicate a normal map texture.
 NORMAL_MAP_FILENAME_SUBSTRINGS = (
@@ -288,7 +371,7 @@ def find_first_bump_node_upstream(start_plug, max_depth=50):
 
 
 PASSTHROUGH_NODES = {
-    "file", "place2dTexture", "colorCorrect",
+    "file", "place2dTexture",
     "remapValue", "remapColor", "remapHsv",
     "multiplyDivide", "clamp", "reverse",
     "blendColors", "condition", "ramp",
@@ -337,6 +420,9 @@ SUPPORTED_SOURCES = [
 # ══════════════════════════════════════════════════════════════════════
 
 MASTER_MAP = {
+    # ══════════════════════════════════════════════════════════════════
+    #  BASE COLOR / DIFFUSE
+    # ══════════════════════════════════════════════════════════════════
     "baseColor": {
         "RedshiftStandardMaterial": ("base_color",         "outColor"),
         "RedshiftMaterial":         ("diffuse_color",      "outColor"),
@@ -367,6 +453,40 @@ MASTER_MAP = {
         "phongE":                   ("color",              "outColor"),
         "MASH":                     ("MASH_Color.texture", "outColor"),
     },
+    # Redshift → others  (inverse key)
+    "base_color": {
+        "aiStandardSurface":        ("baseColor",          "outColor"),
+        "standardSurface":          ("baseColor",          "outColor"),
+        "lambert":                  ("color",              "outColor"),
+        "blinn":                    ("color",              "outColor"),
+        "phong":                    ("color",              "outColor"),
+        "RedshiftStandardMaterial": ("base_color",         "outColor"),
+    },
+    "diffuse_color": {
+        "aiStandardSurface":        ("baseColor",          "outColor"),
+        "standardSurface":          ("baseColor",          "outColor"),
+        "lambert":                  ("color",              "outColor"),
+        "RedshiftStandardMaterial": ("base_color",         "outColor"),
+        "RedshiftMaterial":         ("diffuse_color",      "outColor"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  BASE / DIFFUSE WEIGHT
+    # ══════════════════════════════════════════════════════════════════
+    "base": {
+        "RedshiftStandardMaterial": ("diffuse_weight",     "outAlpha"),
+        "aiStandardSurface":        ("base",               "outAlpha"),
+        "standardSurface":          ("base",               "outAlpha"),
+    },
+    "diffuse_weight": {
+        "aiStandardSurface":        ("base",               "outAlpha"),
+        "standardSurface":          ("base",               "outAlpha"),
+        "RedshiftStandardMaterial": ("diffuse_weight",     "outAlpha"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  ROUGHNESS
+    # ══════════════════════════════════════════════════════════════════
     "specularRoughness": {
         "RedshiftStandardMaterial": ("refl_roughness",     "outAlpha"),
         "RedshiftMaterial":         ("refl_roughness",     "outAlpha"),
@@ -387,6 +507,17 @@ MASTER_MAP = {
         "aiStandardSurface":        ("specularRoughness",  "outAlpha"),
         "standardSurface":          ("specularRoughness",  "outAlpha"),
     },
+    # Redshift → others
+    "refl_roughness": {
+        "aiStandardSurface":        ("specularRoughness",  "outAlpha"),
+        "standardSurface":          ("specularRoughness",  "outAlpha"),
+        "blinn":                    ("eccentricity",       "outAlpha"),
+        "RedshiftStandardMaterial": ("refl_roughness",     "outAlpha"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  METALNESS
+    # ══════════════════════════════════════════════════════════════════
     "metalness": {
         "RedshiftStandardMaterial": ("metalness",          "outAlpha"),
         "RedshiftOpenPBRMaterial":  ("metalness",          "outAlpha"),
@@ -394,6 +525,10 @@ MASTER_MAP = {
         "standardSurface":          ("metalness",          "outAlpha"),
         "MASH":                     ("MASH_Distribute.strengthMap", "outAlpha"),
     },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SPECULAR COLOR / WEIGHT
+    # ══════════════════════════════════════════════════════════════════
     "specularColor": {
         "RedshiftStandardMaterial": ("refl_color",         "outColor"),
         "RedshiftMaterial":         ("refl_color",         "outColor"),
@@ -403,6 +538,64 @@ MASTER_MAP = {
         "phong":                    ("specularColor",      "outColor"),
         "phongE":                   ("specularColor",      "outColor"),
     },
+    "refl_color": {
+        "aiStandardSurface":        ("specularColor",      "outColor"),
+        "standardSurface":          ("specularColor",      "outColor"),
+        "blinn":                    ("specularColor",      "outColor"),
+        "RedshiftStandardMaterial": ("refl_color",         "outColor"),
+    },
+    "specular": {
+        "RedshiftStandardMaterial": ("refl_weight",        "outAlpha"),
+        "aiStandardSurface":        ("specular",           "outAlpha"),
+        "standardSurface":          ("specular",           "outAlpha"),
+    },
+    "refl_weight": {
+        "aiStandardSurface":        ("specular",           "outAlpha"),
+        "standardSurface":          ("specular",           "outAlpha"),
+        "RedshiftStandardMaterial": ("refl_weight",        "outAlpha"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  IOR
+    # ══════════════════════════════════════════════════════════════════
+    "specularIOR": {
+        "RedshiftStandardMaterial": ("refl_ior",           "outAlpha"),
+        "aiStandardSurface":        ("specularIOR",        "outAlpha"),
+        "standardSurface":          ("specularIOR",        "outAlpha"),
+    },
+    "refl_ior": {
+        "aiStandardSurface":        ("specularIOR",        "outAlpha"),
+        "standardSurface":          ("specularIOR",        "outAlpha"),
+        "RedshiftStandardMaterial": ("refl_ior",           "outAlpha"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  ANISOTROPY
+    # ══════════════════════════════════════════════════════════════════
+    "specularAnisotropy": {
+        "RedshiftStandardMaterial": ("refl_aniso",         "outAlpha"),
+        "aiStandardSurface":        ("specularAnisotropy", "outAlpha"),
+        "standardSurface":          ("specularAnisotropy", "outAlpha"),
+    },
+    "refl_aniso": {
+        "aiStandardSurface":        ("specularAnisotropy", "outAlpha"),
+        "standardSurface":          ("specularAnisotropy", "outAlpha"),
+        "RedshiftStandardMaterial": ("refl_aniso",         "outAlpha"),
+    },
+    "specularRotation": {
+        "RedshiftStandardMaterial": ("refl_aniso_rotation", "outAlpha"),
+        "aiStandardSurface":        ("specularRotation",    "outAlpha"),
+        "standardSurface":          ("specularRotation",    "outAlpha"),
+    },
+    "refl_aniso_rotation": {
+        "aiStandardSurface":        ("specularRotation",    "outAlpha"),
+        "standardSurface":          ("specularRotation",    "outAlpha"),
+        "RedshiftStandardMaterial": ("refl_aniso_rotation", "outAlpha"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  EMISSION
+    # ══════════════════════════════════════════════════════════════════
     "emissionColor": {
         "RedshiftStandardMaterial": ("emission_color",     "outColor"),
         "RedshiftIncandescent":     ("color",              "outColor"),
@@ -417,6 +610,25 @@ MASTER_MAP = {
         "aiStandardSurface":        ("emissionColor",      "outColor"),
         "standardSurface":          ("emissionColor",      "outColor"),
     },
+    "emission_color": {
+        "aiStandardSurface":        ("emissionColor",      "outColor"),
+        "standardSurface":          ("emissionColor",      "outColor"),
+        "RedshiftStandardMaterial": ("emission_color",     "outColor"),
+    },
+    "emission": {
+        "RedshiftStandardMaterial": ("emission_weight",    "outAlpha"),
+        "aiStandardSurface":        ("emission",           "outAlpha"),
+        "standardSurface":          ("emission",           "outAlpha"),
+    },
+    "emission_weight": {
+        "aiStandardSurface":        ("emission",           "outAlpha"),
+        "standardSurface":          ("emission",           "outAlpha"),
+        "RedshiftStandardMaterial": ("emission_weight",    "outAlpha"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  OPACITY / TRANSPARENCY
+    # ══════════════════════════════════════════════════════════════════
     "opacity": {
         "RedshiftStandardMaterial": ("opacity_color",      "outColor"),
         "RedshiftMaterial":         ("opacity_color",      "outColor"),
@@ -431,6 +643,15 @@ MASTER_MAP = {
         "standardSurface":          ("opacity",            "outColor"),
         "MASH":                     ("MASH_Distribute.strengthMap", "outAlpha"),
     },
+    "opacity_color": {
+        "aiStandardSurface":        ("opacity",            "outColor"),
+        "standardSurface":          ("opacity",            "outColor"),
+        "RedshiftStandardMaterial": ("opacity_color",      "outColor"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  NORMAL / BUMP
+    # ══════════════════════════════════════════════════════════════════
     "normalCamera": {
         "RedshiftStandardMaterial": ("bump_input",         "out"),
         "RedshiftMaterial":         ("bump_input",         "out"),
@@ -442,11 +663,91 @@ MASTER_MAP = {
         "phong":                    ("normalCamera",       "outNormal"),
         "lambert":                  ("normalCamera",       "outNormal"),
     },
+    "bump_input": {
+        "aiStandardSurface":        ("normalCamera",       "outNormal"),
+        "standardSurface":          ("normalCamera",       "outNormal"),
+        "blinn":                    ("normalCamera",       "outNormal"),
+        "phong":                    ("normalCamera",       "outNormal"),
+        "lambert":                  ("normalCamera",       "outNormal"),
+        "RedshiftStandardMaterial": ("bump_input",         "out"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  DISPLACEMENT
+    # ══════════════════════════════════════════════════════════════════
     "displacementShader": {
         "RedshiftStandardMaterial": ("_displacement_",     "outColor"),
         "RedshiftMaterial":         ("_displacement_",     "outColor"),
         "aiStandardSurface":        ("_displacement_",     "outColor"),
         "standardSurface":          ("_displacement_",     "outColor"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  TRANSMISSION / REFRACTION
+    # ══════════════════════════════════════════════════════════════════
+    "transmission": {
+        "RedshiftStandardMaterial": ("refr_weight",        "outAlpha"),
+        "aiStandardSurface":        ("transmission",       "outAlpha"),
+        "standardSurface":          ("transmission",       "outAlpha"),
+    },
+    "refr_weight": {
+        "aiStandardSurface":        ("transmission",       "outAlpha"),
+        "standardSurface":          ("transmission",       "outAlpha"),
+        "RedshiftStandardMaterial": ("refr_weight",        "outAlpha"),
+    },
+    "transmissionColor": {
+        "RedshiftStandardMaterial": ("refr_color",         "outColor"),
+        "aiStandardSurface":        ("transmissionColor",  "outColor"),
+        "standardSurface":          ("transmissionColor",  "outColor"),
+    },
+    "refr_color": {
+        "aiStandardSurface":        ("transmissionColor",  "outColor"),
+        "standardSurface":          ("transmissionColor",  "outColor"),
+        "RedshiftStandardMaterial": ("refr_color",         "outColor"),
+    },
+    "transmissionDepth": {
+        "RedshiftStandardMaterial": ("refr_absorption_scale", "outAlpha"),
+        "aiStandardSurface":        ("transmissionDepth",     "outAlpha"),
+        "standardSurface":          ("transmissionDepth",     "outAlpha"),
+    },
+    "refr_absorption_scale": {
+        "aiStandardSurface":        ("transmissionDepth",     "outAlpha"),
+        "standardSurface":          ("transmissionDepth",     "outAlpha"),
+        "RedshiftStandardMaterial": ("refr_absorption_scale", "outAlpha"),
+    },
+    "transmissionScatter": {
+        "RedshiftStandardMaterial": ("refr_absorption_color", "outColor"),
+        "aiStandardSurface":        ("transmissionScatter",   "outColor"),
+        "standardSurface":          ("transmissionScatter",   "outColor"),
+    },
+    "refr_absorption_color": {
+        "aiStandardSurface":        ("transmissionScatter",   "outColor"),
+        "standardSurface":          ("transmissionScatter",   "outColor"),
+        "RedshiftStandardMaterial": ("refr_absorption_color", "outColor"),
+    },
+    "transmissionExtraRoughness": {
+        "RedshiftStandardMaterial": ("refr_roughness",              "outAlpha"),
+        "aiStandardSurface":        ("transmissionExtraRoughness",  "outAlpha"),
+        "standardSurface":          ("transmissionExtraRoughness",  "outAlpha"),
+    },
+    "refr_roughness": {
+        "aiStandardSurface":        ("transmissionExtraRoughness",  "outAlpha"),
+        "standardSurface":          ("transmissionExtraRoughness",  "outAlpha"),
+        "RedshiftStandardMaterial": ("refr_roughness",              "outAlpha"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SUBSURFACE SCATTERING
+    # ══════════════════════════════════════════════════════════════════
+    "subsurface": {
+        "RedshiftStandardMaterial": ("subsurface_weight",  "outAlpha"),
+        "aiStandardSurface":        ("subsurface",         "outAlpha"),
+        "standardSurface":          ("subsurface",         "outAlpha"),
+    },
+    "subsurface_weight": {
+        "aiStandardSurface":        ("subsurface",         "outAlpha"),
+        "standardSurface":          ("subsurface",         "outAlpha"),
+        "RedshiftStandardMaterial": ("subsurface_weight",  "outAlpha"),
     },
     "subsurfaceColor": {
         "RedshiftStandardMaterial": ("subsurface_color",   "outColor"),
@@ -454,49 +755,190 @@ MASTER_MAP = {
         "aiStandardSurface":        ("subsurfaceColor",    "outColor"),
         "standardSurface":          ("subsurfaceColor",    "outColor"),
     },
+    "subsurface_color": {
+        "aiStandardSurface":        ("subsurfaceColor",    "outColor"),
+        "standardSurface":          ("subsurfaceColor",    "outColor"),
+        "RedshiftStandardMaterial": ("subsurface_color",   "outColor"),
+    },
+    "subsurfaceRadius": {
+        "RedshiftStandardMaterial": ("subsurface_radius",  "outColor"),
+        "aiStandardSurface":        ("subsurfaceRadius",   "outColor"),
+        "standardSurface":          ("subsurfaceRadius",   "outColor"),
+    },
+    "subsurface_radius": {
+        "aiStandardSurface":        ("subsurfaceRadius",   "outColor"),
+        "standardSurface":          ("subsurfaceRadius",   "outColor"),
+        "RedshiftStandardMaterial": ("subsurface_radius",  "outColor"),
+    },
+    "subsurfaceScale": {
+        "RedshiftStandardMaterial": ("subsurface_scale",   "outAlpha"),
+        "aiStandardSurface":        ("subsurfaceScale",    "outAlpha"),
+        "standardSurface":          ("subsurfaceScale",    "outAlpha"),
+    },
+    "subsurface_scale": {
+        "aiStandardSurface":        ("subsurfaceScale",    "outAlpha"),
+        "standardSurface":          ("subsurfaceScale",    "outAlpha"),
+        "RedshiftStandardMaterial": ("subsurface_scale",   "outAlpha"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  COAT / CLEARCOAT
+    # ══════════════════════════════════════════════════════════════════
+    "coat": {
+        "RedshiftStandardMaterial": ("coat_weight",        "outAlpha"),
+        "aiStandardSurface":        ("coat",               "outAlpha"),
+        "standardSurface":          ("coat",               "outAlpha"),
+    },
+    "coat_weight": {
+        "aiStandardSurface":        ("coat",               "outAlpha"),
+        "standardSurface":          ("coat",               "outAlpha"),
+        "RedshiftStandardMaterial": ("coat_weight",        "outAlpha"),
+    },
     "coatColor": {
         "RedshiftStandardMaterial": ("coat_color",         "outColor"),
         "aiStandardSurface":        ("coatColor",          "outColor"),
         "standardSurface":          ("coatColor",          "outColor"),
+    },
+    "coat_color": {
+        "aiStandardSurface":        ("coatColor",          "outColor"),
+        "standardSurface":          ("coatColor",          "outColor"),
+        "RedshiftStandardMaterial": ("coat_color",         "outColor"),
     },
     "coatRoughness": {
         "RedshiftStandardMaterial": ("coat_roughness",     "outAlpha"),
         "aiStandardSurface":        ("coatRoughness",      "outAlpha"),
         "standardSurface":          ("coatRoughness",      "outAlpha"),
     },
-    "base": {
-        "RedshiftStandardMaterial": ("diffuse_weight",     "outAlpha"),
-        "aiStandardSurface":        ("base",               "outAlpha"),
-        "standardSurface":          ("base",               "outAlpha"),
+    "coat_roughness": {
+        "aiStandardSurface":        ("coatRoughness",      "outAlpha"),
+        "standardSurface":          ("coatRoughness",      "outAlpha"),
+        "RedshiftStandardMaterial": ("coat_roughness",     "outAlpha"),
     },
-    "specular": {
-        "RedshiftStandardMaterial": ("refl_weight",        "outAlpha"),
-        "aiStandardSurface":        ("specular",           "outAlpha"),
-        "standardSurface":          ("specular",           "outAlpha"),
+    "coatIOR": {
+        "RedshiftStandardMaterial": ("coat_ior",           "outAlpha"),
+        "aiStandardSurface":        ("coatIOR",            "outAlpha"),
+        "standardSurface":          ("coatIOR",            "outAlpha"),
     },
-    "emission": {
-        "RedshiftStandardMaterial": ("emission_weight",    "outAlpha"),
-        "aiStandardSurface":        ("emission",           "outAlpha"),
-        "standardSurface":          ("emission",           "outAlpha"),
+    "coat_ior": {
+        "aiStandardSurface":        ("coatIOR",            "outAlpha"),
+        "standardSurface":          ("coatIOR",            "outAlpha"),
+        "RedshiftStandardMaterial": ("coat_ior",           "outAlpha"),
     },
-    "subsurface": {
-        "RedshiftStandardMaterial": ("subsurface_weight",  "outAlpha"),
-        "aiStandardSurface":        ("subsurface",         "outAlpha"),
-        "standardSurface":          ("subsurface",         "outAlpha"),
+    "coatNormal": {
+        "RedshiftStandardMaterial": ("coat_bump_input",    "out"),
+        "aiStandardSurface":        ("coatNormal",         "outNormal"),
+        "standardSurface":          ("coatNormal",         "outNormal"),
     },
-    "coat": {
-        "RedshiftStandardMaterial": ("coat_weight",        "outAlpha"),
-        "aiStandardSurface":        ("coat",               "outAlpha"),
-        "standardSurface":          ("coat",               "outAlpha"),
+    "coat_bump_input": {
+        "aiStandardSurface":        ("coatNormal",         "outNormal"),
+        "standardSurface":          ("coatNormal",         "outNormal"),
+        "RedshiftStandardMaterial": ("coat_bump_input",    "out"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SHEEN
+    # ══════════════════════════════════════════════════════════════════
+    "sheen": {
+        "RedshiftStandardMaterial": ("sheen_weight",       "outAlpha"),
+        "aiStandardSurface":        ("sheen",              "outAlpha"),
+        "standardSurface":          ("sheen",              "outAlpha"),
+    },
+    "sheen_weight": {
+        "aiStandardSurface":        ("sheen",              "outAlpha"),
+        "standardSurface":          ("sheen",              "outAlpha"),
+        "RedshiftStandardMaterial": ("sheen_weight",       "outAlpha"),
+    },
+    "sheenColor": {
+        "RedshiftStandardMaterial": ("sheen_color",        "outColor"),
+        "aiStandardSurface":        ("sheenColor",         "outColor"),
+        "standardSurface":          ("sheenColor",         "outColor"),
+    },
+    "sheen_color": {
+        "aiStandardSurface":        ("sheenColor",         "outColor"),
+        "standardSurface":          ("sheenColor",         "outColor"),
+        "RedshiftStandardMaterial": ("sheen_color",        "outColor"),
+    },
+    "sheenRoughness": {
+        "RedshiftStandardMaterial": ("sheen_roughness",    "outAlpha"),
+        "aiStandardSurface":        ("sheenRoughness",     "outAlpha"),
+        "standardSurface":          ("sheenRoughness",     "outAlpha"),
+    },
+    "sheen_roughness": {
+        "aiStandardSurface":        ("sheenRoughness",     "outAlpha"),
+        "standardSurface":          ("sheenRoughness",     "outAlpha"),
+        "RedshiftStandardMaterial": ("sheen_roughness",    "outAlpha"),
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    #  THIN FILM / IRIDESCENCE
+    # ══════════════════════════════════════════════════════════════════
+    "thinFilmThickness": {
+        "RedshiftStandardMaterial": ("thin_film_thickness", "outAlpha"),
+        "aiStandardSurface":        ("thinFilmThickness",   "outAlpha"),
+        "standardSurface":          ("thinFilmThickness",   "outAlpha"),
+    },
+    "thin_film_thickness": {
+        "aiStandardSurface":        ("thinFilmThickness",   "outAlpha"),
+        "standardSurface":          ("thinFilmThickness",   "outAlpha"),
+        "RedshiftStandardMaterial": ("thin_film_thickness", "outAlpha"),
+    },
+    "thinFilmIOR": {
+        "RedshiftStandardMaterial": ("thin_film_ior",      "outAlpha"),
+        "aiStandardSurface":        ("thinFilmIOR",        "outAlpha"),
+        "standardSurface":          ("thinFilmIOR",        "outAlpha"),
+    },
+    "thin_film_ior": {
+        "aiStandardSurface":        ("thinFilmIOR",        "outAlpha"),
+        "standardSurface":          ("thinFilmIOR",        "outAlpha"),
+        "RedshiftStandardMaterial": ("thin_film_ior",      "outAlpha"),
     },
 }
 
-VALUE_MAP = {k: MASTER_MAP[k] for k in [
-    "baseColor", "color", "specularRoughness", "metalness",
-    "specularColor", "emissionColor", "incandescence", "opacity",
-    "base", "specular", "emission", "subsurface", "coat",
-    "coatRoughness", "eccentricity",
-]}
+# VALUE_MAP: attributes that can be transferred as raw float/color values
+# (not just textures). Built dynamically from MASTER_MAP keys.
+_VALUE_KEYS = [
+    # Base color / diffuse
+    "baseColor", "color", "base_color", "diffuse_color",
+    "base", "diffuse_weight",
+    # Roughness
+    "specularRoughness", "eccentricity", "roughness", "refl_roughness",
+    # Metalness
+    "metalness",
+    # Specular
+    "specularColor", "refl_color", "specular", "refl_weight",
+    # IOR
+    "specularIOR", "refl_ior",
+    # Anisotropy
+    "specularAnisotropy", "refl_aniso", "specularRotation", "refl_aniso_rotation",
+    # Emission
+    "emissionColor", "incandescence", "emission_color", "emission", "emission_weight",
+    # Opacity
+    "opacity", "transparency", "opacity_color",
+    # Transmission
+    "transmission", "refr_weight",
+    "transmissionColor", "refr_color",
+    "transmissionDepth", "refr_absorption_scale",
+    "transmissionScatter", "refr_absorption_color",
+    "transmissionExtraRoughness", "refr_roughness",
+    # SSS
+    "subsurface", "subsurface_weight",
+    "subsurfaceColor", "subsurface_color",
+    "subsurfaceRadius", "subsurface_radius",
+    "subsurfaceScale", "subsurface_scale",
+    # Coat
+    "coat", "coat_weight",
+    "coatColor", "coat_color",
+    "coatRoughness", "coat_roughness",
+    "coatIOR", "coat_ior",
+    # Sheen
+    "sheen", "sheen_weight",
+    "sheenColor", "sheen_color",
+    "sheenRoughness", "sheen_roughness",
+    # Thin film
+    "thinFilmThickness", "thin_film_thickness",
+    "thinFilmIOR", "thin_film_ior",
+]
+VALUE_MAP = {k: MASTER_MAP[k] for k in _VALUE_KEYS if k in MASTER_MAP}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1470,7 +1912,7 @@ class NodeFlowTool(QtWidgets.QDialog):
         lc  = QtWidgets.QVBoxLayout()
         t   = QtWidgets.QLabel("⚡  NodeFlow")
         s   = QtWidgets.QLabel(
-            "Transfer Any Texture · Any Shader · Any Target  |  v4.2.0"
+            "Transfer Any Texture · Any Shader · Any Target  |  v4.3.0"
         )
         t.setObjectName("titleLabel")
         s.setObjectName("subtitleLabel")
@@ -1699,41 +2141,53 @@ class NodeFlowTool(QtWidgets.QDialog):
         help_text.setHtml("""
         <div style='color:#cdd9e5;font-family:Segoe UI;font-size:13px;line-height:1.8'>
         <p style='color:#4080d0;font-size:16px;font-weight:bold'>
-            ⚡ NodeFlow v4.1 — How to Use
+            &#9889; NodeFlow v4.3 &mdash; How to Use
         </p>
         <p style='color:#7aa2c8;font-weight:bold'>What NodeFlow Does</p>
-        <p>Converts full materials between renderers — textures, values,
-        intermediate nodes (bump, color correct, range) — and auto-assigns
+        <p>Converts full materials between renderers &mdash; textures, values,
+        intermediate nodes (bump, color correct, range) &mdash; and auto-assigns
         every mesh to the new shader. Old shaders are kept for rollback.</p>
 
-        <p style='color:#7aa2c8;font-weight:bold'>Node Chain Fix (v4.1)</p>
-        <p>When a bump2d or aiNormalMap is in the chain, NodeFlow now correctly:
-        <ul>
-          <li>Creates RedshiftBumpMap (or equivalent)</li>
-          <li>Wires file → new bump node input</li>
-          <li>Wires new bump node output → shader.bump_input</li>
-        </ul>
-        All intermediate node outputs are fully rewired — nothing is left dangling.</p>
+        <p style='color:#7aa2c8;font-weight:bold'>Bi-directional Transfers (v4.3)</p>
+        <p>Full bi-directional transfers between all renderers.
+        Redshift attributes (base_color, refl_roughness, refr_weight, etc.)
+        are now recognized as source keys.</p>
 
-        <p style='color:#7aa2c8;font-weight:bold'>Conversion Map</p>
+        <p style='color:#7aa2c8;font-weight:bold'>Supported Properties</p>
         <ul>
-            <li>bump2d → RedshiftBumpMap (inputType=0, height)</li>
-            <li>aiNormalMap → RedshiftBumpMap (inputType=1, tangent normal)</li>
-            <li>aiColorCorrect → rsColorCorrect</li>
-            <li>aiRange → rsRange</li>
-            <li>aiMultiply → rsColorLayer</li>
+          <li>Base Color, Roughness, Metalness, Specular, IOR</li>
+          <li>Anisotropy + Rotation</li>
+          <li>Emission (weight + color)</li>
+          <li>Opacity / Transparency</li>
+          <li>Transmission (weight, color, depth, scatter, roughness)</li>
+          <li>Subsurface (weight, color, radius, scale)</li>
+          <li>Coat (weight, color, roughness, IOR, normal)</li>
+          <li>Sheen (weight, color, roughness)</li>
+          <li>Thin Film (thickness, IOR)</li>
+          <li>Normal / Bump / Displacement</li>
+        </ul>
+
+        <p style='color:#7aa2c8;font-weight:bold'>Node Conversion Map</p>
+        <ul>
+            <li>bump2d &harr; RedshiftBumpMap (height)</li>
+            <li>aiNormalMap &harr; RedshiftBumpMap (tangent normal)</li>
+            <li>RedshiftNormalMap &rarr; aiNormalMap / bump2d</li>
+            <li>aiColorCorrect &harr; rsColorCorrect &harr; colorCorrect</li>
+            <li>aiRange &harr; rsRange &harr; remapValue</li>
+            <li>aiMultiply &harr; rsColorLayer &harr; multiplyDivide</li>
+            <li>rsTexture &rarr; file (Arnold/Maya)</li>
         </ul>
 
         <p style='color:#7aa2c8;font-weight:bold'>Auto Suggest</p>
         <ul>
-            <li>aiStandardSurface → RedshiftStandardMaterial</li>
-            <li>RedshiftStandardMaterial → aiStandardSurface</li>
-            <li>lambert / blinn / phong → standardSurface</li>
-            <li>standardSurface → aiStandardSurface</li>
+            <li>aiStandardSurface &rarr; RedshiftStandardMaterial</li>
+            <li>RedshiftStandardMaterial &rarr; aiStandardSurface</li>
+            <li>lambert / blinn / phong &rarr; standardSurface</li>
+            <li>standardSurface &rarr; aiStandardSurface</li>
         </ul>
         <br><hr style='border-color:#1e3a5f'><br>
         <p style='color:#445e78;font-size:11px'>
-            NodeFlow v4.1.0 · Youssef El Qadi · Pipeline TD
+            NodeFlow v4.3.0 &middot; Youssef El Qadi &middot; Pipeline TD
         </p>
         </div>
         """)
